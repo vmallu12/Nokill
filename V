@@ -28,7 +28,7 @@ TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
 NODE_NAME = "TEMPEST CLOUD"
 
 # Domain & Web Panel Settings (HTTP Mode)
-DOMAIN_NAME = "kvm.kingrules.bond"     # Your domain
+DOMAIN_NAME = "kvm.kingrules.bond"
 PANEL_PORT = 2345
 PANEL_URL = f"http://{DOMAIN_NAME}"
 DB_PATH = "tempest_vms.db"
@@ -82,7 +82,10 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 docker_client = docker.from_env()
 app = FastAPI(title="Tempest Cloud Panel")
 
-# ----------------- DATABASE INITIALIZATION -----------------
+# Single active terminal session tracker per VM: {vm_id: WebSocket}
+active_vm_sockets: dict[int, WebSocket] = {}
+
+# ----------------- DATABASE SETUP -----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -201,7 +204,7 @@ async def revoke_client_role_if_empty(user_id: int):
                     except Exception:
                         pass
 
-# ----------------- DOCKER ENGINE -----------------
+# ----------------- DOCKER OPERATIONS -----------------
 def launch_vm_container(name: str, ram: str, cpu: str, disk: str, vnc_port: int, ssh_port: int, vnc_pass: str, root_pass: str):
     try:
         old = docker_client.containers.get(name)
@@ -280,7 +283,7 @@ def get_container_stats(container_name: str):
     except Exception:
         return {"online": False, "ram_used": 0, "ram_total": 1, "ram_str": "0 MB", "cpu_pct": 0.0, "disk_str": "Offline"}
 
-# ----------------- PERMISSION VERIFIER -----------------
+# ----------------- ACCESS PERMISSIONS -----------------
 async def verify_vm_access(user_id_str: Optional[str], vm_id: int) -> tuple[bool, Optional[tuple]]:
     if not user_id_str or not user_id_str.isdigit():
         return False, None
@@ -295,13 +298,12 @@ async def verify_vm_access(user_id_str: Optional[str], vm_id: int) -> tuple[bool
         return True, row
     return False, None
 
-# ----------------- WEB PANEL TEMPLATES (JINJA2) -----------------
+# ----------------- DASHBOARD TEMPLATES -----------------
 HTML_LOGIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tempest Cloud • Login</title>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
@@ -342,8 +344,7 @@ HTML_DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ node_name }} • Virtual Machine Hub</title>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
@@ -375,7 +376,7 @@ HTML_DASHBOARD_TEMPLATE = """
         .charts-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 20px; }
         .chart-box { background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
         .chart-box h4 { font-size: 14px; color: var(--sec); margin-bottom: 10px; }
-        #terminal-container { height: 440px; border-radius: 12px; overflow: hidden; background: #000; padding: 10px; border: 1px solid var(--border); }
+        #terminal-wrapper { height: 440px; border-radius: 12px; overflow: hidden; background: #000; padding: 10px; border: 1px solid var(--border); }
         .file-manager { background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
         .file-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; gap: 10px; flex-wrap: wrap; }
         .file-list { width: 100%; border-collapse: collapse; font-family: 'JetBrains Mono', monospace; font-size: 14px; }
@@ -431,7 +432,11 @@ HTML_DASHBOARD_TEMPLATE = """
 
             <!-- Tab 2: Terminal -->
             <div id="tab-terminal" class="tab-content" style="display:none;">
-                <div id="terminal-container"></div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                    <span style="font-size:14px; color:var(--sec);">Active Instance: <b id="active-terminal-title" style="color:var(--accent);">VM #{{ vms[0].vm_id if vms else '' }}</b></span>
+                    <button class="tab-btn" style="background:#222733; color:#fff; padding:6px 12px; font-size:12px;" onclick="renderTerminalForVM(currentVmId)">Restart Session</button>
+                </div>
+                <div id="terminal-wrapper"></div>
             </div>
 
             <!-- Tab 3: File Manager -->
@@ -456,7 +461,7 @@ HTML_DASHBOARD_TEMPLATE = """
 
     <script>
         let currentVmId = "{{ vms[0].vm_id if vms else '' }}";
-        let term = null, ws = null, fitAddon = null, cpuChart = null, ramChart = null;
+        let currentTerm = null, currentWs = null, currentFitAddon = null, cpuChart = null, ramChart = null;
 
         function initCharts() {
             const ctxCpu = document.getElementById('cpuChart').getContext('2d');
@@ -497,8 +502,14 @@ HTML_DASHBOARD_TEMPLATE = """
             document.querySelectorAll('.vm-card').forEach(c => c.classList.remove('active'));
             el.classList.add('active');
             currentVmId = vmId;
-            if (term) destroyTerminal();
-            switchTab('metrics');
+            const titleEl = document.getElementById('active-terminal-title');
+            if (titleEl) titleEl.innerText = `VM #${vmId}`;
+            
+            if (document.getElementById('tab-terminal').style.display !== 'none') {
+                renderTerminalForVM(currentVmId);
+            } else if (document.getElementById('tab-files').style.display !== 'none') {
+                loadFiles();
+            }
         }
 
         function switchTab(tabName) {
@@ -509,46 +520,53 @@ HTML_DASHBOARD_TEMPLATE = """
             document.getElementById(`tab-${tabName}`).style.display = 'block';
 
             if(tabName === 'terminal') {
-                setTimeout(startTerminal, 100);
+                renderTerminalForVM(currentVmId);
             } else if(tabName === 'files') {
                 loadFiles();
             }
         }
 
-        function startTerminal() {
-            if (term) return;
-            const container = document.getElementById('terminal-container');
-            container.innerHTML = '';
-            
-            term = new Terminal({
+        function renderTerminalForVM(vmId) {
+            const wrapper = document.getElementById('terminal-wrapper');
+            wrapper.innerHTML = '';
+
+            if (currentWs) {
+                currentWs.close();
+                currentWs = null;
+            }
+            if (currentTerm) {
+                currentTerm.dispose();
+                currentTerm = null;
+            }
+
+            currentTerm = new Terminal({
                 cursorBlink: true,
                 fontSize: 14,
                 fontFamily: "'JetBrains Mono', monospace",
                 theme: { background: '#000000' }
             });
-            fitAddon = new FitAddon.FitAddon();
-            term.loadAddon(fitAddon);
-            term.open(container);
-            fitAddon.fit();
+            currentFitAddon = new FitAddon.FitAddon();
+            currentTerm.loadAddon(currentFitAddon);
+            currentTerm.open(wrapper);
+            setTimeout(() => { try { currentFitAddon.fit(); } catch(e) {} }, 50);
 
             const loc = window.location;
-            const wsUri = (loc.protocol === 'https:' ? 'wss:' : 'ws:') + `//${loc.host}/ws/terminal/${currentVmId}`;
-            ws = new WebSocket(wsUri);
+            const wsUri = (loc.protocol === 'https:' ? 'wss:' : 'ws:') + `//${loc.host}/ws/terminal/${vmId}`;
+            currentWs = new WebSocket(wsUri);
 
-            ws.onmessage = (ev) => term.write(ev.data);
-            term.onData(data => { if(ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
-            ws.onclose = () => term.write('\\r\\n\\x1b[31m[Connection Terminated]\\x1b[0m\\r\\n');
-        }
-
-        function destroyTerminal() {
-            if (ws) { ws.close(); ws = null; }
-            if (term) { term.dispose(); term = null; }
+            currentWs.onmessage = (ev) => currentTerm.write(ev.data);
+            currentTerm.onData(data => {
+                if (currentWs && currentWs.readyState === WebSocket.OPEN) currentWs.send(data);
+            });
+            currentWs.onclose = () => {
+                currentTerm.write('\\r\\n\\x1b[31m[Session Disconnected]\\x1b[0m\\r\\n');
+            };
         }
 
         async function loadFiles() {
             const res = await fetch(`/api/vm/${currentVmId}/files`);
             if(!res.ok) {
-                alert("Permission Denied or Error loading directory.");
+                alert("Permission Denied: Unable to fetch directory.");
                 return;
             }
             const files = await res.json();
@@ -649,8 +667,7 @@ async def dashboard_page(request: Request):
         return HTMLResponse("<body style='background:#0b0e14;color:#fff;font-family:sans-serif;padding:50px;'><h2>No active virtual machines found under your account.</h2><br><a style='color:#7952ff' href='/logout'>Sign Out</a></body>")
 
     t = Template(HTML_DASHBOARD_TEMPLATE)
-    rendered = t.render(node_name=NODE_NAME, vms=vms)
-    return HTMLResponse(rendered)
+    return HTMLResponse(t.render(node_name=NODE_NAME, vms=vms))
 
 @app.get("/api/vm/{vm_id}/stats")
 async def api_vm_stats(request: Request, vm_id: int):
@@ -659,49 +676,95 @@ async def api_vm_stats(request: Request, vm_id: int):
         return JSONResponse({"error": "Unauthorized"}, status_code=403)
     return get_container_stats(data[3])
 
-# ----------------- DIRECT WEBSOCKET TERMINAL (AUTHENTICATED) -----------------
+# ----------------- NATIVE SINGLE-SESSION WEBSOCKET TERMINAL -----------------
 @app.websocket("/ws/terminal/{vm_id}")
 async def websocket_terminal(websocket: WebSocket, vm_id: int):
     await websocket.accept()
-    
+
+    # Enforce strictly 1 terminal session per VM: disconnect existing socket
+    if vm_id in active_vm_sockets:
+        old_ws = active_vm_sockets[vm_id]
+        try:
+            await old_ws.send_text("\r\n\x1b[33m[Session Terminated: New terminal connection initiated]\x1b[0m\r\n")
+            await old_ws.close()
+        except Exception:
+            pass
+
+    active_vm_sockets[vm_id] = websocket
+
     user_id_cookie = websocket.cookies.get("auth_session")
     allowed, data = await verify_vm_access(user_id_cookie, vm_id)
     if not allowed:
-        await websocket.send_text("\r\n\x1b[31m[Access Denied: You do not own this virtual machine]\x1b[0m\r\n")
+        await websocket.send_text("\r\n\x1b[31m[Access Denied: Unauthorized Session]\x1b[0m\r\n")
         await websocket.close()
+        active_vm_sockets.pop(vm_id, None)
         return
 
     owner_id, ssh_port, root_pass, c_name = data
 
+    container_ip = "127.0.0.1"
+    try:
+        container = docker_client.containers.get(c_name)
+        if container.status != "running":
+            await websocket.send_text("\r\n\x1b[31m[Error: Container is offline]\x1b[0m\r\n")
+            await websocket.close()
+            active_vm_sockets.pop(vm_id, None)
+            return
+
+        inspect_data = docker_client.api.inspect_container(container.id)
+        networks = inspect_data.get("NetworkSettings", {}).get("Networks", {})
+        for _, net_conf in networks.items():
+            if net_conf.get("IPAddress"):
+                container_ip = net_conf["IPAddress"]
+                break
+    except Exception as e:
+        await websocket.send_text(f"\r\n\x1b[31m[Container Error: {str(e)}]\x1b[0m\r\n")
+        await websocket.close()
+        active_vm_sockets.pop(vm_id, None)
+        return
+
+    targets = [
+        (container_ip, 2222),
+        ("127.0.0.1", int(ssh_port)),
+        ("0.0.0.0", int(ssh_port))
+    ]
+
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    loop = asyncio.get_running_loop()
+
+    def try_connect():
+        for host, port in targets:
+            try:
+                ssh.connect(
+                    hostname=host,
+                    port=port,
+                    username="root",
+                    password=root_pass,
+                    look_for_keys=False,
+                    allow_agent=False,
+                    timeout=2
+                )
+                return True
+            except Exception:
+                continue
+        return False
 
     connected = False
     for _ in range(25):
-        try:
-            ssh.connect(
-                hostname="127.0.0.1",
-                port=int(ssh_port),
-                username="root",
-                password=root_pass,
-                look_for_keys=False,
-                allow_agent=False,
-                timeout=3
-            )
-            connected = True
+        connected = await loop.run_in_executor(None, try_connect)
+        if connected:
             break
-        except Exception:
-            await asyncio.sleep(1)
+        await asyncio.sleep(1)
 
     if not connected:
-        await websocket.send_text("\r\n\x1b[31m[System Error: Guest VM SSH daemon still initializing. Re-open in 5s...]\x1b[0m\r\n")
+        await websocket.send_text("\r\n\x1b[31m[System Error: Guest VM SSH Daemon Timed Out]\x1b[0m\r\n")
         await websocket.close()
+        active_vm_sockets.pop(vm_id, None)
         return
 
     channel = ssh.invoke_shell(term='xterm-256color', width=100, height=30)
     channel.setblocking(False)
-
-    loop = asyncio.get_running_loop()
 
     async def pty_to_ws():
         while not channel.closed:
@@ -735,7 +798,10 @@ async def websocket_terminal(websocket: WebSocket, vm_id: int):
     channel.close()
     ssh.close()
 
-# ----------------- SFTP FILE MANAGER (AUTHENTICATED) -----------------
+    if active_vm_sockets.get(vm_id) == websocket:
+        active_vm_sockets.pop(vm_id, None)
+
+# ----------------- SFTP FILE MANAGER -----------------
 @app.get("/api/vm/{vm_id}/files")
 async def list_files(request: Request, vm_id: int):
     allowed, data = await verify_vm_access(request.cookies.get("auth_session"), vm_id)
@@ -869,7 +935,7 @@ class VMControlView(discord.ui.View):
                     f"{E_YES} **Virtual Machine #{self.vm_id} has been cleanly re-imaged!**\n\n"
                     f"{E_ARROW} **Instance Name:** `{self.container_name}`\n"
                     f"{E_ARROW} **Container ID:** `{new_id[:12]}`\n"
-                    f"{E_STAR} Open the [Web Dashboard]({PANEL_URL}) to resume terminal operations."
+                    f"{E_STAR} Open the [Web Dashboard]({PANEL_URL}) to resume operations."
                 ),
                 color=0x57F287,
                 timestamp=datetime.datetime.now(datetime.timezone.utc)
@@ -1249,7 +1315,7 @@ async def set_expiration(ctx, target: discord.User, *args):
     )
     await ctx.reply(embed=exp_embed)
 
-# Fixed Admin Management Commands
+# Admin Management Commands
 @bot.command(name="setadmin", aliases=["giveadmin"])
 async def set_admin(ctx, target: discord.User):
     if not await is_admin(ctx.author.id):
@@ -1429,7 +1495,7 @@ async def expiry_check_loop():
             except Exception:
                 continue
 
-# ----------------- DUAL RUNNER (DISCORD BOT + FASTAPI) -----------------
+# ----------------- APPLICATION LAUNCHER -----------------
 def start_web_panel():
     uvicorn.run(app, host="0.0.0.0", port=PANEL_PORT, log_level="warning")
 
