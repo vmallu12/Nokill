@@ -12,11 +12,12 @@ import time
 import re
 import io
 import json
+import socket
 import threading
 from typing import Optional, Union
 
 # Web Framework & SSH Bridge
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, UploadFile, File, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, UploadFile, File, status, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from jinja2 import Template
 import uvicorn
@@ -27,9 +28,9 @@ TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
 NODE_NAME = "TEMPEST CLOUD"
 
 # Domain & Web Panel Settings (HTTP Mode)
-DOMAIN_NAME = "kvm.kingrules.bond"     # Set to your domain
+DOMAIN_NAME = "kvm.kingrules.bond"     # Your domain
 PANEL_PORT = 2345
-PANEL_URL = f"http://{DOMAIN_NAME}"     # Set to your domain
+PANEL_URL = f"http://{DOMAIN_NAME}"
 DB_PATH = "tempest_vms.db"
 
 # Customer/Client Role ID
@@ -81,7 +82,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 docker_client = docker.from_env()
 app = FastAPI(title="Tempest Cloud Panel")
 
-# ----------------- DATABASE SETUP -----------------
+# ----------------- DATABASE INITIALIZATION -----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -128,7 +129,6 @@ def gen_password(length=12):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 def get_free_port(base_start: int):
-    import socket
     port = base_start
     while port < 65000:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -279,6 +279,21 @@ def get_container_stats(container_name: str):
         }
     except Exception:
         return {"online": False, "ram_used": 0, "ram_total": 1, "ram_str": "0 MB", "cpu_pct": 0.0, "disk_str": "Offline"}
+
+# ----------------- PERMISSION VERIFIER -----------------
+async def verify_vm_access(user_id_str: Optional[str], vm_id: int) -> tuple[bool, Optional[tuple]]:
+    if not user_id_str or not user_id_str.isdigit():
+        return False, None
+    uid = int(user_id_str)
+    admin = await is_admin(uid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT owner_id, ssh_port, root_pass, container_name FROM vms WHERE vm_id = ?", (vm_id,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return False, None
+    if row[0] == uid or admin:
+        return True, row
+    return False, None
 
 # ----------------- WEB PANEL TEMPLATES (JINJA2) -----------------
 HTML_LOGIN_TEMPLATE = """
@@ -464,6 +479,7 @@ HTML_DASHBOARD_TEMPLATE = """
             if(!currentVmId) return;
             try {
                 const res = await fetch(`/api/vm/${currentVmId}/stats`);
+                if (!res.ok) return;
                 const data = await res.json();
                 
                 cpuChart.data.datasets[0].data.shift();
@@ -531,6 +547,10 @@ HTML_DASHBOARD_TEMPLATE = """
 
         async function loadFiles() {
             const res = await fetch(`/api/vm/${currentVmId}/files`);
+            if(!res.ok) {
+                alert("Permission Denied or Error loading directory.");
+                return;
+            }
             const files = await res.json();
             const tbody = document.getElementById('file-table-body');
             tbody.innerHTML = '';
@@ -554,7 +574,8 @@ HTML_DASHBOARD_TEMPLATE = """
 
         async function deleteFile(filename) {
             if(!confirm(`Delete "${filename}" permanently?`)) return;
-            await fetch(`/api/vm/${currentVmId}/files?filename=${encodeURIComponent(filename)}`, { method: 'DELETE' });
+            const res = await fetch(`/api/vm/${currentVmId}/files?filename=${encodeURIComponent(filename)}`, { method: 'DELETE' });
+            if (!res.ok) alert("Permission Denied.");
             loadFiles();
         }
 
@@ -566,7 +587,8 @@ HTML_DASHBOARD_TEMPLATE = """
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
 
-            await fetch(`/api/vm/${currentVmId}/upload`, { method: 'POST', body: formData });
+            const res = await fetch(`/api/vm/${currentVmId}/upload`, { method: 'POST', body: formData });
+            if (!res.ok) alert("Permission Denied.");
             fileInput.value = '';
             loadFiles();
         }
@@ -609,8 +631,18 @@ async def dashboard_page(request: Request):
     if not user_id:
         return RedirectResponse(url="/")
 
+    uid = int(user_id)
+    admin = await is_admin(uid)
+
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT vm_id, ram, cpu, disk, expires_at FROM vms WHERE owner_id = ?", (user_id,)) as cur:
+        if admin:
+            query = "SELECT vm_id, ram, cpu, disk, expires_at FROM vms"
+            params = ()
+        else:
+            query = "SELECT vm_id, ram, cpu, disk, expires_at FROM vms WHERE owner_id = ?"
+            params = (uid,)
+
+        async with db.execute(query, params) as cur:
             vms = [{"vm_id": r[0], "ram": r[1], "cpu": r[2], "disk": r[3], "expires_at": r[4]} for r in await cur.fetchall()]
 
     if not vms:
@@ -621,132 +653,100 @@ async def dashboard_page(request: Request):
     return HTMLResponse(rendered)
 
 @app.get("/api/vm/{vm_id}/stats")
-async def api_vm_stats(vm_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT container_name FROM vms WHERE vm_id = ?", (vm_id,)) as cur:
-            row = await cur.fetchone()
-    if not row:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return get_container_stats(row[0])
+async def api_vm_stats(request: Request, vm_id: int):
+    allowed, data = await verify_vm_access(request.cookies.get("auth_session"), vm_id)
+    if not allowed:
+        return JSONResponse({"error": "Unauthorized"}, status_code=403)
+    return get_container_stats(data[3])
 
-# ----------------- DIRECT WEBSOCKET TERMINAL (DOCKER PTY BRIDGE) -----------------
+# ----------------- DIRECT WEBSOCKET TERMINAL (AUTHENTICATED) -----------------
 @app.websocket("/ws/terminal/{vm_id}")
 async def websocket_terminal(websocket: WebSocket, vm_id: int):
     await websocket.accept()
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT container_name, root_pass FROM vms WHERE vm_id = ?", (vm_id,)) as cur:
-            row = await cur.fetchone()
-            
-    if not row:
-        await websocket.send_text("\r\n\x1b[31m[Error: VM not found in database]\x1b[0m\r\n")
+    user_id_cookie = websocket.cookies.get("auth_session")
+    allowed, data = await verify_vm_access(user_id_cookie, vm_id)
+    if not allowed:
+        await websocket.send_text("\r\n\x1b[31m[Access Denied: You do not own this virtual machine]\x1b[0m\r\n")
         await websocket.close()
         return
 
-    container_name, root_pass = row
+    owner_id, ssh_port, root_pass, c_name = data
 
-    try:
-        container = docker_client.containers.get(container_name)
-        if container.status != "running":
-            await websocket.send_text("\r\n\x1b[31m[Error: VM container is not currently running]\x1b[0m\r\n")
-            await websocket.close()
-            return
-    except Exception as e:
-        await websocket.send_text(f"\r\n\x1b[31m[Docker Error: {str(e)}]\x1b[0m\r\n")
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    connected = False
+    for _ in range(25):
+        try:
+            ssh.connect(
+                hostname="127.0.0.1",
+                port=int(ssh_port),
+                username="root",
+                password=root_pass,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=3
+            )
+            connected = True
+            break
+        except Exception:
+            await asyncio.sleep(1)
+
+    if not connected:
+        await websocket.send_text("\r\n\x1b[31m[System Error: Guest VM SSH daemon still initializing. Re-open in 5s...]\x1b[0m\r\n")
         await websocket.close()
         return
 
-    # Ensure container has required bridge tools
-    container.exec_run("apk add --no-cache sshpass openssh-client 2>/dev/null")
-
-    # Command connecting directly to internal QEMU guest SSH daemon (Port 2222)
-    exec_cmd = (
-        f"sh -c \""
-        f"for i in $(seq 1 60); do "
-        f"  nc -z 127.0.0.1 2222 2>/dev/null && break; "
-        f"  sleep 1; "
-        f"done; "
-        f"exec sshpass -p '{root_pass}' ssh -tt "
-        f"-o StrictHostKeyChecking=no "
-        f"-o UserKnownHostsFile=/dev/null "
-        f"-o LogLevel=QUIET "
-        f"-p 2222 root@127.0.0.1"
-        f"\""
-    )
+    channel = ssh.invoke_shell(term='xterm-256color', width=100, height=30)
+    channel.setblocking(False)
 
     loop = asyncio.get_running_loop()
 
-    try:
-        exec_instance = await loop.run_in_executor(
-            None,
-            lambda: docker_client.api.exec_create(
-                container.id,
-                cmd=exec_cmd,
-                stdin=True,
-                tty=True,
-                environment={"TERM": "xterm-256color"}
-            )
-        )
-        
-        stream = await loop.run_in_executor(
-            None,
-            lambda: docker_client.api.exec_start(exec_instance['Id'], socket=True, tty=True)
-        )
-        sock = stream._sock
-
-    except Exception as e:
-        await websocket.send_text(f"\r\n\x1b[31m[Failed to launch terminal bridge: {str(e)}]\x1b[0m\r\n")
-        await websocket.close()
-        return
-
-    sock.setblocking(False)
-
-    async def pty_reader():
-        while True:
+    async def pty_to_ws():
+        while not channel.closed:
             try:
-                data = await loop.run_in_executor(None, sock.recv, 1024)
-                if not data:
+                recv_data = await loop.run_in_executor(None, channel.recv, 1024)
+                if not recv_data:
                     break
-                await websocket.send_text(data.decode("utf-8", errors="ignore"))
-            except Exception:
+                await websocket.send_text(recv_data.decode("utf-8", errors="ignore"))
+            except (BlockingIOError, socket.error):
                 await asyncio.sleep(0.02)
+            except Exception:
+                break
 
-    async def ws_reader():
+    async def ws_to_pty():
         try:
-            while True:
+            while not channel.closed:
                 msg = await websocket.receive_text()
-                sock.sendall(msg.encode("utf-8", errors="ignore"))
+                await loop.run_in_executor(None, channel.send, msg)
         except WebSocketDisconnect:
             pass
         except Exception:
             pass
 
-    task_read = asyncio.create_task(pty_reader())
-    task_write = asyncio.create_task(ws_reader())
+    task_read = asyncio.create_task(pty_to_ws())
+    task_write = asyncio.create_task(ws_to_pty())
 
     await asyncio.wait([task_read, task_write], return_when=asyncio.FIRST_COMPLETED)
     
     task_read.cancel()
     task_write.cancel()
-    try:
-        sock.close()
-    except Exception:
-        pass
+    channel.close()
+    ssh.close()
 
-# ----------------- SFTP FILE MANAGER -----------------
+# ----------------- SFTP FILE MANAGER (AUTHENTICATED) -----------------
 @app.get("/api/vm/{vm_id}/files")
-async def list_files(vm_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT ssh_port, root_pass FROM vms WHERE vm_id = ?", (vm_id,)) as cur:
-            row = await cur.fetchone()
-    if not row:
-        return JSONResponse([], status_code=404)
+async def list_files(request: Request, vm_id: int):
+    allowed, data = await verify_vm_access(request.cookies.get("auth_session"), vm_id)
+    if not allowed:
+        return JSONResponse({"error": "Unauthorized"}, status_code=403)
 
-    ssh_port, root_pass = row
+    owner_id, ssh_port, root_pass, c_name = data
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        ssh.connect("127.0.0.1", port=ssh_port, username="root", password=root_pass, timeout=3)
+        ssh.connect("127.0.0.1", port=int(ssh_port), username="root", password=root_pass, timeout=3)
         sftp = ssh.open_sftp()
         file_list = []
         for attr in sftp.listdir_attr("/root"):
@@ -763,17 +763,16 @@ async def list_files(vm_id: int):
         return JSONResponse([], status_code=200)
 
 @app.delete("/api/vm/{vm_id}/files")
-async def delete_file(vm_id: int, filename: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT ssh_port, root_pass FROM vms WHERE vm_id = ?", (vm_id,)) as cur:
-            row = await cur.fetchone()
-    if not row:
-        return JSONResponse({"error": "not found"}, status_code=404)
+async def delete_file(request: Request, vm_id: int, filename: str):
+    allowed, data = await verify_vm_access(request.cookies.get("auth_session"), vm_id)
+    if not allowed:
+        return JSONResponse({"error": "Unauthorized"}, status_code=403)
 
+    owner_id, ssh_port, root_pass, c_name = data
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        ssh.connect("127.0.0.1", port=row[0], username="root", password=row[1], timeout=3)
+        ssh.connect("127.0.0.1", port=int(ssh_port), username="root", password=root_pass, timeout=3)
         sftp = ssh.open_sftp()
         path = f"/root/{os.path.basename(filename)}"
         try:
@@ -787,17 +786,16 @@ async def delete_file(vm_id: int, filename: str):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/api/vm/{vm_id}/upload")
-async def upload_file(vm_id: int, file: UploadFile = File(...)):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT ssh_port, root_pass FROM vms WHERE vm_id = ?", (vm_id,)) as cur:
-            row = await cur.fetchone()
-    if not row:
-        return JSONResponse({"error": "not found"}, status_code=404)
+async def upload_file(request: Request, vm_id: int, file: UploadFile = File(...)):
+    allowed, data = await verify_vm_access(request.cookies.get("auth_session"), vm_id)
+    if not allowed:
+        return JSONResponse({"error": "Unauthorized"}, status_code=403)
 
+    owner_id, ssh_port, root_pass, c_name = data
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        ssh.connect("127.0.0.1", port=row[0], username="root", password=row[1], timeout=3)
+        ssh.connect("127.0.0.1", port=int(ssh_port), username="root", password=root_pass, timeout=3)
         sftp = ssh.open_sftp()
         remote_path = f"/root/{os.path.basename(file.filename)}"
         contents = await file.read()
@@ -819,15 +817,25 @@ class VMControlView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id or await is_admin(interaction.user.id):
             return True
-        await interaction.response.send_message(f"{E_NO} Access denied: You do not own this virtual machine.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title=f"{E_NO} Access Restricted",
+                description=f"{E_WARN} You do not have permission to manage this virtual machine.",
+                color=0xED4245
+            ),
+            ephemeral=True
+        )
         return False
 
     @discord.ui.button(label="Reinstall Operating System", style=discord.ButtonStyle.danger, emoji="🔄")
     async def reinstall_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         loading = discord.Embed(
-            title=f"{E_LOADING} {NODE_NAME} • Reinstalling OS",
-            description=f"{E_ARROW} Re-imaging root disk volume for `{self.container_name}`...\n"
-                        f"{E_GEAR} Preserving assigned network ports, credentials, and expiry schedules...",
+            title=f"{E_LOADING} {NODE_NAME} • Processing Reinstallation",
+            description=(
+                f"{E_ARROW} Target Slice: `{self.container_name}`\n"
+                f"{E_GEAR} Rebuilding NVMe root image to Ubuntu 24 standard...\n"
+                f"{E_STAR} Preserving external port allocations and credentials..."
+            ),
             color=0xFEE75C
         )
         await interaction.response.send_message(embed=loading, ephemeral=True)
@@ -837,7 +845,12 @@ class VMControlView(discord.ui.View):
                 row = await cur.fetchone()
 
         if not row:
-            await interaction.edit_original_response(content=f"{E_NO} VM configuration not found.")
+            fail_embed = discord.Embed(
+                title=f"{E_NO} Operation Aborted",
+                description=f"{E_WARN} Target instance record is missing from the database.",
+                color=0xED4245
+            )
+            await interaction.edit_original_response(embed=fail_embed)
             return
 
         ram, cpu, disk, vnc_port, ssh_port, vnc_pass, root_pass = row
@@ -851,14 +864,24 @@ class VMControlView(discord.ui.View):
                 await db.commit()
 
             success = discord.Embed(
-                title=f"{E_CHECK} Reinstallation Completed",
-                description=f"{E_YES} **VM #{self.vm_id}** cleanly re-imaged with Ubuntu 24 OS.\n"
-                            f"{E_STAR} Open the [Web Dashboard]({PANEL_URL}) to access the terminal.",
-                color=0x57F287
+                title=f"{E_CHECK} Operating System Reinstalled",
+                description=(
+                    f"{E_YES} **Virtual Machine #{self.vm_id} has been cleanly re-imaged!**\n\n"
+                    f"{E_ARROW} **Instance Name:** `{self.container_name}`\n"
+                    f"{E_ARROW} **Container ID:** `{new_id[:12]}`\n"
+                    f"{E_STAR} Open the [Web Dashboard]({PANEL_URL}) to resume terminal operations."
+                ),
+                color=0x57F287,
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
             )
             await interaction.edit_original_response(embed=success)
         except Exception as e:
-            await interaction.edit_original_response(content=f"{E_NO} Reinstall failed: `{str(e)}`")
+            err_embed = discord.Embed(
+                title=f"{E_NO} Reinstall Execution Error",
+                description=f"```{str(e)}```",
+                color=0xED4245
+            )
+            await interaction.edit_original_response(embed=err_embed)
 
 # ----------------- DISCORD COMMANDS -----------------
 @bot.event
@@ -866,7 +889,7 @@ async def on_ready():
     await init_db()
     expiry_check_loop.start()
     anti_mining_monitor.start()
-    print(f"Nova Cloud active on {NODE_NAME} • Web Panel listening on port {PANEL_PORT}")
+    print(f"Nova Cloud online on {NODE_NAME} • Web Panel listening on port {PANEL_PORT}")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -885,8 +908,8 @@ async def on_message(message: discord.Message):
 async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days: int = 28):
     if not await is_admin(ctx.author.id):
         err = discord.Embed(
-            title=f"{E_NO} Access Restricted",
-            description=f"{E_WARN} This instruction is strictly restricted to **{NODE_NAME}** Administrators.",
+            title=f"{E_NO} Unauthorized Operation",
+            description=f"{E_WARN} This action is restricted to **{NODE_NAME}** Administrators.",
             color=0xED4245
         )
         await ctx.reply(embed=err)
@@ -894,8 +917,10 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
 
     init_embed = discord.Embed(
         title=f"{E_LOADING} Initializing Virtual Machine Slice",
-        description=f"{E_ARROW} Slicing hardware virtualization for {user.mention} on **{NODE_NAME}**...\n"
-                    f"{E_GEAR} Allocating `{cpu} vCPU` | `{ram} GB RAM` | `{disk} GB NVMe`...",
+        description=(
+            f"{E_ARROW} Allocating hardware resources for {user.mention} on **{NODE_NAME}**...\n"
+            f"{E_GEAR} Provisioning `{cpu} vCPU` | `{ram} GB RAM` | `{disk} GB NVMe`..."
+        ),
         color=0xFEE75C
     )
     status_msg = await ctx.reply(embed=init_embed)
@@ -933,27 +958,29 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
 
         dm_embed = discord.Embed(
             title=f"{E_KING_CROWN} {NODE_NAME} • Cloud Console Access Keys",
-            description=f"{E_STAR} **Your dedicated virtual slice (`VM #{vm_id}`) has been provisioned!**\n"
-                        f"{E_LIGHTNING} Manage your instance via the dedicated Web Dashboard.",
+            description=(
+                f"{E_STAR} **Your dedicated virtual slice (`VM #{vm_id}`) is active!**\n"
+                f"{E_LIGHTNING} Manage your machine, metrics, and files via the web dashboard."
+            ),
             color=0x7952FF,
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
         dm_embed.add_field(
             name="🌐 Web Management Console",
             value=(
-                f"{E_ARROW} **Dashboard URL:** [Click Here to Open Panel]({PANEL_URL})\n"
+                f"{E_ARROW} **Dashboard URL:** [Open Dashboard]({PANEL_URL})\n"
                 f"{E_ARROW} **Username:** `{panel_user}`\n"
                 f"{E_ARROW} **Password:** `{panel_pass}`\n"
-                f"{E_FIRE} *Web Terminal, Performance Graphs & SFTP File Manager included.*"
+                f"{E_FIRE} *Web Terminal, Live Performance Charts & SFTP Included.*"
             ),
             inline=False
         )
         dm_embed.add_field(
             name="🔑 Direct SSH Authorization",
             value=(
-                f"{E_ARROW} **Direct SSH:** `ssh root@{DOMAIN_NAME} -p {ssh_port}`\n"
+                f"{E_ARROW} **Host:** `ssh root@{DOMAIN_NAME} -p {ssh_port}`\n"
                 f"{E_ARROW} **Root Password:** `{root_pass}`\n"
-                f"{E_ARROW} **Web VNC Port:** `{vnc_port}` (Pass: `{vnc_pass}`)"
+                f"{E_ARROW} **VNC Port:** `{vnc_port}` (Password: `{vnc_pass}`)"
             ),
             inline=False
         )
@@ -961,7 +988,7 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
             name="⚙️ Hardware Specifications",
             value=(
                 f"{E_ARROW_DOUBLE} **Processor:** `{cpu} vCPU Core(s)`\n"
-                f"{E_ARROW_DOUBLE} **Memory:** `{ram} GB Dedicated RAM`\n"
+                f"{E_ARROW_DOUBLE} **Memory:** `{ram} GB Dedicated DDR5`\n"
                 f"{E_ARROW_DOUBLE} **Storage:** `{disk} GB NVMe PCIe 5.0`\n"
                 f"{E_ARROW_DOUBLE} **Lease Term:** `{expires_at}` ({days} Days)"
             ),
@@ -976,9 +1003,11 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
             dm_delivered = False
 
         embed = discord.Embed(
-            title=f"{E_CHECK} {NODE_NAME} • Virtual Machine Deployed",
-            description=f"{E_YES} **VM #{vm_id}** is now online and assigned to {user.mention}.\n"
-                        f"{E_STAR} Discussion, specifications, and telemetry are active.",
+            title=f"{E_CHECK} {NODE_NAME} • Virtual Machine Provisioned",
+            description=(
+                f"{E_YES} **VM #{vm_id}** is now online and assigned to {user.mention}.\n"
+                f"{E_STAR} Real-time performance monitors and panel controls are ready."
+            ),
             color=0x57F287,
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
@@ -986,19 +1015,19 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
             name="📋 Hardware Specifications",
             value=(
                 f"{E_ARROW} **Instance ID:** `VM #{vm_id}` (`{cid[:12]}`)\n"
-                f"{E_ARROW} **CPU:** `{cpu} vCPU` | **RAM:** `{ram} GB` | **Disk:** `{disk} GB`\n"
-                f"{E_ARROW} **Network:** SSH `{ssh_port}` | VNC `{vnc_port}`\n"
+                f"{E_ARROW} **Resources:** `{cpu} vCPU` | `{ram} GB RAM` | `{disk} GB NVMe`\n"
+                f"{E_ARROW} **Ports:** SSH `{ssh_port}` | VNC `{vnc_port}`\n"
                 f"{E_ARROW} **Expiration:** `{expires_at}`"
             ),
             inline=False
         )
         embed.add_field(
-            name="🌐 Web Management Access",
+            name="🌐 Web Management Console",
             value=(
-                f"{E_ARROW} **Dashboard:** [Open Web Dashboard]({PANEL_URL})\n"
-                + (f"{E_CHECK} *Credentials successfully delivered to {user.mention}'s DMs.*"
+                f"{E_ARROW} **Dashboard:** [Open Panel]({PANEL_URL})\n"
+                + (f"{E_CHECK} *Credentials delivered to {user.mention}'s DMs.*"
                    if dm_delivered else
-                   f"{E_WARN} *DMs closed! Username:* `{panel_user}` | *Password:* `{panel_pass}`")
+                   f"{E_WARN} *DMs closed! Fallback Username:* `{panel_user}` | *Password:* `{panel_pass}`")
             ),
             inline=False
         )
@@ -1008,7 +1037,7 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
 
     except Exception as e:
         err_embed = discord.Embed(
-            title=f"{E_NO} Allocation Error",
+            title=f"{E_NO} Provisioning Error",
             description=f"```{str(e)}```",
             color=0xED4245
         )
@@ -1019,6 +1048,12 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
 async def manage_cmd(ctx, user: Optional[discord.User] = None):
     target = user if user else ctx.author
     if target != ctx.author and not await is_admin(ctx.author.id):
+        err = discord.Embed(
+            title=f"{E_NO} Access Restricted",
+            description=f"{E_WARN} Only administrators can inspect instances belonging to other members.",
+            color=0xED4245
+        )
+        await ctx.reply(embed=err)
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1026,7 +1061,12 @@ async def manage_cmd(ctx, user: Optional[discord.User] = None):
             records = await cur.fetchall()
 
     if not records:
-        await ctx.reply(f"{E_WARN} No virtual machines assigned to {target.mention}.")
+        empty = discord.Embed(
+            title=f"{E_INFO} Instance Inventory",
+            description=f"{E_WARN} No virtual machine instances found for {target.mention}.",
+            color=0x2B2D31
+        )
+        await ctx.reply(embed=empty)
         return
 
     vm_id, c_name, ram, cpu, disk, ssh_port, vnc_port, expires_at = records[0]
@@ -1035,9 +1075,11 @@ async def manage_cmd(ctx, user: Optional[discord.User] = None):
     status_label = "ONLINE" if stats["online"] else "OFFLINE"
 
     embed = discord.Embed(
-        title=f"{E_KING_CROWN} {NODE_NAME} • Instance Dashboard",
-        description=f"{E_STAR} **Managing resources for {target.mention}**\n"
-                    f"{E_LIGHTNING} Use the Web Panel for terminal access and SFTP uploads: [Web Dashboard]({PANEL_URL})",
+        title=f"{E_KING_CROWN} {NODE_NAME} • Instance Dashboard (VM #{vm_id})",
+        description=(
+            f"{E_STAR} **Resource allocation for {target.mention}**\n"
+            f"{E_LIGHTNING} Manage instance via [Web Dashboard]({PANEL_URL})"
+        ),
         color=0x5865F2,
         timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
@@ -1046,9 +1088,9 @@ async def manage_cmd(ctx, user: Optional[discord.User] = None):
         value=(
             f"{E_ARROW} **Status:** {status_icon} `{status_label}`\n"
             f"{E_ARROW} **Instance Name:** `{c_name}`\n"
-            f"{E_ARROW} **CPU:** `{cpu} vCPU` (Utilization: `{stats['cpu_pct']}%`)\n"
-            f"{E_ARROW} **RAM:** `{ram} GB` (Active: `{stats['ram_str']}`)\n"
-            f"{E_ARROW} **Storage:** `{disk} GB` (Used: `{stats['disk_str']}`)"
+            f"{E_ARROW} **CPU Load:** `{cpu} vCPU` (`{stats['cpu_pct']}%`)\n"
+            f"{E_ARROW} **RAM Active:** `{ram} GB` (`{stats['ram_str']}`)\n"
+            f"{E_ARROW} **Storage Volume:** `{disk} GB` (`{stats['disk_str']}`)"
         ),
         inline=False
     )
@@ -1070,12 +1112,20 @@ async def delete_vm(ctx, target: Union[int, discord.User]):
     if not await is_admin(ctx.author.id):
         return
 
+    progress_embed = discord.Embed(
+        title=f"{E_LOADING} Decommissioning Instance",
+        description=f"{E_ARROW} Terminating container slices and unmounting volumes...",
+        color=0xFEE75C
+    )
+    msg = await ctx.reply(embed=progress_embed)
+
     async with aiosqlite.connect(DB_PATH) as db:
         if isinstance(target, int):
             async with db.execute("SELECT owner_id, container_name FROM vms WHERE vm_id = ?", (target,)) as cur:
                 row = await cur.fetchone()
             if not row:
-                return await ctx.reply(f"{E_WARN} Virtual machine #{target} was not found.")
+                err = discord.Embed(title=f"{E_NO} Deletion Error", description=f"{E_WARN} Virtual machine #{target} was not found.", color=0xED4245)
+                return await msg.edit(embed=err)
             owner_id, c_name = row
             try:
                 docker_client.containers.get(c_name).remove(force=True)
@@ -1085,12 +1135,20 @@ async def delete_vm(ctx, target: Union[int, discord.User]):
             await db.execute("DELETE FROM vms WHERE vm_id = ?", (target,))
             await db.commit()
             await revoke_client_role_if_empty(owner_id)
-            await ctx.reply(f"{E_CHECK} Virtual machine **#{target}** (`{c_name}`) wiped cleanly.")
+            
+            success = discord.Embed(
+                title=f"{E_CHECK} Machine Decommissioned",
+                description=f"{E_YES} **VM #{target}** (`{c_name}`) wiped cleanly from cluster storage.",
+                color=0xED4245,
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            await msg.edit(embed=success)
         else:
             async with db.execute("SELECT vm_id, container_name FROM vms WHERE owner_id = ?", (target.id,)) as cur:
                 rows = await cur.fetchall()
             if not rows:
-                return await ctx.reply(f"{E_WARN} No virtual machines found for {target.mention}.")
+                err = discord.Embed(title=f"{E_NO} Deletion Error", description=f"{E_WARN} No virtual machines found for {target.mention}.", color=0xED4245)
+                return await msg.edit(embed=err)
             for vm_id, c_name in rows:
                 try:
                     docker_client.containers.get(c_name).remove(force=True)
@@ -1100,7 +1158,14 @@ async def delete_vm(ctx, target: Union[int, discord.User]):
             await db.execute("DELETE FROM vms WHERE owner_id = ?", (target.id,))
             await db.commit()
             await revoke_client_role_if_empty(target.id)
-            await ctx.reply(f"{E_CHECK} All **{len(rows)}** virtual machine(s) owned by {target.mention} have been wiped.")
+            
+            success = discord.Embed(
+                title=f"{E_CHECK} Member Slices Purged",
+                description=f"{E_YES} Terminated **{len(rows)}** virtual machine(s) owned by {target.mention}.",
+                color=0xED4245,
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            await msg.edit(embed=success)
 
 # Renew Command
 @bot.command(name="renew")
@@ -1116,7 +1181,8 @@ async def renew_vm(ctx, target: discord.User, specific_vm_id: Optional[int] = No
             records = await cur.fetchall()
 
         if not records:
-            return await ctx.reply(f"{E_WARN} No active virtual machines found for {target.mention}.")
+            err = discord.Embed(title=f"{E_WARN} Renewal Notice", description=f"No active instances found for {target.mention}.", color=0xED4245)
+            return await ctx.reply(embed=err)
 
         for vm_id, exp_str in records:
             try:
@@ -1129,7 +1195,17 @@ async def renew_vm(ctx, target: discord.User, specific_vm_id: Optional[int] = No
         await db.commit()
 
     await grant_client_role(target.id)
-    await ctx.reply(f"{E_CHECK} Successfully renewed **{len(records)}** instance(s) for {target.mention} (+28 Days).")
+    
+    renew_embed = discord.Embed(
+        title=f"{E_CHECK} Subscription Renewed (+28 Days)",
+        description=(
+            f"{E_STAR} **Successfully extended {len(records)} instance(s) for {target.mention}!**\n"
+            f"{E_ARROW} Client tier role <@&{CLIENT_ROLE_ID}> active."
+        ),
+        color=0x57F287,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    await ctx.reply(embed=renew_embed)
 
 # Set Expiration Command
 @bot.command(name="setexp")
@@ -1144,7 +1220,12 @@ async def set_expiration(ctx, target: discord.User, *args):
 
     duration = parse_time_duration(args_list)
     if not duration:
-        return await ctx.reply(f"{E_WARN} Invalid time format. Examples: `!setexp @user 28d` or `!setexp @user 2 hours 1`")
+        err = discord.Embed(
+            title=f"{E_WARN} Parameter Syntax",
+            description="Usage: `!setexp @user <duration> [vm_id]`\nExamples: `!setexp @user 28d` or `!setexp @user 2 hours 1`",
+            color=0xED4245
+        )
+        return await ctx.reply(embed=err)
 
     now = datetime.datetime.now(datetime.timezone.utc)
     new_expiry = (now + duration).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1156,7 +1237,62 @@ async def set_expiration(ctx, target: discord.User, *args):
             await db.execute("UPDATE vms SET expires_at = ? WHERE owner_id = ?", (new_expiry, target.id))
         await db.commit()
 
-    await ctx.reply(f"{E_CHECK} Updated expiration date for {target.mention} to `{new_expiry}`.")
+    exp_embed = discord.Embed(
+        title=f"{E_GEAR} Expiration Schedule Adjusted",
+        description=(
+            f"{E_CHECK} **Updated instance expiration for {target.mention}!**\n\n"
+            f"{E_ARROW} **New Expiration:** `{new_expiry}`\n"
+            f"{E_ARROW} **Duration Added:** `{duration}`"
+        ),
+        color=0x5865F2,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    await ctx.reply(embed=exp_embed)
+
+# Fixed Admin Management Commands
+@bot.command(name="setadmin", aliases=["giveadmin"])
+async def set_admin(ctx, target: discord.User):
+    if not await is_admin(ctx.author.id):
+        err = discord.Embed(
+            title=f"{E_NO} Unauthorized",
+            description=f"{E_WARN} Only cluster owners can modify administrator permissions.",
+            color=0xED4245
+        )
+        return await ctx.reply(embed=err)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (target.id,))
+        await db.commit()
+
+    admin_embed = discord.Embed(
+        title=f"{E_KING_CROWN} Administrator Assigned",
+        description=f"{E_CHECK} {E_YES} Granted administrator permissions to {target.mention}.",
+        color=0x57F287,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    await ctx.reply(embed=admin_embed)
+
+@bot.command(name="removeadmin")
+async def remove_admin(ctx, target: discord.User):
+    if not await is_admin(ctx.author.id) or target.id == MAIN_OWNER_ID:
+        err = discord.Embed(
+            title=f"{E_NO} Action Blocked",
+            description=f"{E_WARN} Cannot remove administrator permissions from this member.",
+            color=0xED4245
+        )
+        return await ctx.reply(embed=err)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM admins WHERE user_id = ?", (target.id,))
+        await db.commit()
+
+    admin_embed = discord.Embed(
+        title=f"{E_WARN} Administrator Revoked",
+        description=f"{E_CHECK} Revoked administrator permissions from {target.mention}.",
+        color=0xED4245,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    await ctx.reply(embed=admin_embed)
 
 # Infrastructure Telemetry
 @bot.command(name="vinfo")
@@ -1165,28 +1301,36 @@ async def vinfo_cmd(ctx):
         return
     embed = discord.Embed(
         title=f"{E_KING_CROWN} {NODE_NAME} • Infrastructure Telemetry",
-        description=f"{E_LIGHTNING} **Node:** `tempest-tier1-master-01.dc-node.net`\n"
-                    f"{E_STAR} **Hypervisor:** `Linux 6.8.0-40-generic x86_64` | `KVM Acceleration Enabled`\n"
-                    f"{E_ARROW} **Management Console:** [Click to Open Panel]({PANEL_URL})",
+        description=(
+            f"{E_LIGHTNING} **Node:** `tempest-tier1-master-01.dc-node.net`\n"
+            f"{E_STAR} **Hypervisor:** `Linux 6.8.0-40-generic x86_64` | `KVM Enabled`\n"
+            f"{E_ARROW} **Management Console:** [Open Web Dashboard]({PANEL_URL})"
+        ),
         color=0x5865F2,
         timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
     embed.add_field(
         name=f"{E_THUNDER} Primary Processing Array",
-        value=f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
-              f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]",
+        value=(
+            f"{E_ARROW} **Processor:** `Dual AMD EPYC™ 9654 (128 Cores / 256 Threads @ 3.70 GHz)`\n"
+            f"{E_ARROW} **Cluster Load:** `14.2%` [██░░░░░░░░░░░░░░░░░░]"
+        ),
         inline=False
     )
     embed.add_field(
         name=f"{E_GEAR} DDR5 ECC Registered Memory",
-        value=f"{E_ARROW} **Total:** `500.0 GB` | **Available:** `457.2 GB`\n"
-              f"{E_ARROW} **Utilization:** `8.5%` [██░░░░░░░░░░░░░░░░░░]",
+        value=(
+            f"{E_ARROW} **Total:** `500.0 GB` | **Available:** `457.2 GB`\n"
+            f"{E_ARROW} **Utilization:** `8.5%` [██░░░░░░░░░░░░░░░░░░]"
+        ),
         inline=False
     )
     embed.add_field(
         name=f"{E_FIRE} Enterprise NVMe Storage Fabric",
-        value=f"{E_ARROW} **Pool Capacity:** `10,000.0 GB (10 TB)` | **Free:** `9,887.6 GB`\n"
-              f"{E_ARROW} **RAID Configuration:** `RAID-10 NVMe PCIe 5.0 (64 Gbps)`",
+        value=(
+            f"{E_ARROW} **Pool Capacity:** `10,000.0 GB (10 TB)` | **Free:** `9,887.6 GB`\n"
+            f"{E_ARROW} **RAID Configuration:** `RAID-10 NVMe PCIe 5.0 (64 Gbps)`"
+        ),
         inline=False
     )
     embed.set_footer(text=f"{NODE_NAME} • Tier-4 Datacenter Facilities", icon_url=bot.user.display_avatar.url)
@@ -1202,11 +1346,16 @@ async def vminfo_cmd(ctx):
             records = await cur.fetchall()
 
     if not records:
-        return await ctx.reply(f"{E_INFO} No active virtual machines on cluster.")
+        empty = discord.Embed(
+            title=f"{E_INFO} Virtual Machine Registry",
+            description=f"{E_WARN} No active virtual machine allocations found on cluster.",
+            color=0x2B2D31
+        )
+        return await ctx.reply(embed=empty)
 
     embed = discord.Embed(
         title=f"{E_KING_CROWN} {NODE_NAME} • Global Virtual Machine Registry",
-        description=f"{E_STAR} **Active Provisioned Instances:** `{len(records)}`",
+        description=f"{E_STAR} **Active Provisioned Slices:** `{len(records)}`",
         color=0x2B2D31,
         timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
@@ -1249,6 +1398,15 @@ async def anti_mining_monitor():
                     await db.execute("DELETE FROM vms WHERE vm_id = ?", (vm_id,))
                     await db.commit()
                 await revoke_client_role_if_empty(owner_id)
+
+                channel = bot.get_channel(ALERT_CHANNEL_ID)
+                if channel:
+                    alert = discord.Embed(
+                        title=f"{E_WARN} SECURITY ALERT: CRYPTO MINING PURGE",
+                        description=f"Process signature `{detected}` detected on `{c_name}` (VM #{vm_id}). Container and NVMe storage destroyed.",
+                        color=0xED4245
+                    )
+                    await channel.send(content=f"<@{MINING_ALERT_PING_ID}>", embed=alert)
         except Exception:
             continue
 
