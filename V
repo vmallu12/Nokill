@@ -526,11 +526,17 @@ HTML_DASHBOARD_TEMPLATE = """
             }
         }
 
+        function getCookie(name) {
+            const v = document.cookie.match('(^|;) ?' + name + '=([^;]*)(;|$)');
+            return v ? v[2] : null;
+        }
+
         function renderTerminalForVM(vmId) {
             const wrapper = document.getElementById('terminal-wrapper');
             wrapper.innerHTML = '';
 
             if (currentWs) {
+                currentWs.onclose = null;
                 currentWs.close();
                 currentWs = null;
             }
@@ -541,24 +547,36 @@ HTML_DASHBOARD_TEMPLATE = """
 
             currentTerm = new Terminal({
                 cursorBlink: true,
-                fontSize: 14,
+                fontSize: 13,
                 fontFamily: "'JetBrains Mono', monospace",
                 theme: { background: '#000000' }
             });
             currentFitAddon = new FitAddon.FitAddon();
             currentTerm.loadAddon(currentFitAddon);
             currentTerm.open(wrapper);
-            setTimeout(() => { try { currentFitAddon.fit(); } catch(e) {} }, 50);
+            
+            setTimeout(() => { 
+                try { currentFitAddon.fit(); } catch(e) {} 
+            }, 60);
 
+            const token = getCookie('auth_session') || '';
             const loc = window.location;
-            const wsUri = (loc.protocol === 'https:' ? 'wss:' : 'ws:') + `//${loc.host}/ws/terminal/${vmId}`;
+            const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUri = `${wsProtocol}//${loc.host}/ws/terminal/${vmId}?token=${encodeURIComponent(token)}`;
+
             currentWs = new WebSocket(wsUri);
 
-            currentWs.onmessage = (ev) => currentTerm.write(ev.data);
-            currentTerm.onData(data => {
-                if (currentWs && currentWs.readyState === WebSocket.OPEN) currentWs.send(data);
+            currentWs.onmessage = (ev) => {
+                currentTerm.write(ev.data);
+            };
+
+            currentTerm.onData((data) => {
+                if (currentWs && currentWs.readyState === WebSocket.OPEN) {
+                    currentWs.send(data);
+                }
             });
-            currentWs.onclose = () => {
+
+            currentWs.onclose = (e) => {
                 currentTerm.write('\\r\\n\\x1b[31m[Session Disconnected]\\x1b[0m\\r\\n');
             };
         }
@@ -676,127 +694,107 @@ async def api_vm_stats(request: Request, vm_id: int):
         return JSONResponse({"error": "Unauthorized"}, status_code=403)
     return get_container_stats(data[3])
 
-# ----------------- NATIVE SINGLE-SESSION WEBSOCKET TERMINAL -----------------
+# ----------------- BULLETPROOF WEBSOCKET TERMINAL -----------------
 @app.websocket("/ws/terminal/{vm_id}")
 async def websocket_terminal(websocket: WebSocket, vm_id: int):
     await websocket.accept()
 
-    # Enforce strictly 1 terminal session per VM: disconnect existing socket
-    if vm_id in active_vm_sockets:
+    # Query param token with fallback to auth_session cookie
+    auth_token = websocket.query_params.get("token") or websocket.cookies.get("auth_session")
+    allowed, data = await verify_vm_access(auth_token, vm_id)
+    if not allowed:
+        await websocket.send_text("\r\n\x1b[31m[Access Denied: Authentication Required or Unauthorized]\x1b[0m\r\n")
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    owner_id, ssh_port, root_pass, c_name = data
+
+    # Clean existing socket for this specific VM if a separate socket connects
+    if vm_id in active_vm_sockets and active_vm_sockets[vm_id] != websocket:
         old_ws = active_vm_sockets[vm_id]
         try:
-            await old_ws.send_text("\r\n\x1b[33m[Session Terminated: New terminal connection initiated]\x1b[0m\r\n")
+            await old_ws.send_text("\r\n\x1b[33m[Session Terminated: Connected from another tab/device]\x1b[0m\r\n")
             await old_ws.close()
         except Exception:
             pass
 
     active_vm_sockets[vm_id] = websocket
 
-    user_id_cookie = websocket.cookies.get("auth_session")
-    allowed, data = await verify_vm_access(user_id_cookie, vm_id)
-    if not allowed:
-        await websocket.send_text("\r\n\x1b[31m[Access Denied: Unauthorized Session]\x1b[0m\r\n")
-        await websocket.close()
-        active_vm_sockets.pop(vm_id, None)
-        return
-
-    owner_id, ssh_port, root_pass, c_name = data
-
-    container_ip = "127.0.0.1"
     try:
         container = docker_client.containers.get(c_name)
         if container.status != "running":
-            await websocket.send_text("\r\n\x1b[31m[Error: Container is offline]\x1b[0m\r\n")
+            await websocket.send_text("\r\n\x1b[31m[Error: Container is stopped/offline]\x1b[0m\r\n")
             await websocket.close()
-            active_vm_sockets.pop(vm_id, None)
             return
 
-        inspect_data = docker_client.api.inspect_container(container.id)
-        networks = inspect_data.get("NetworkSettings", {}).get("Networks", {})
-        for _, net_conf in networks.items():
-            if net_conf.get("IPAddress"):
-                container_ip = net_conf["IPAddress"]
-                break
-    except Exception as e:
-        await websocket.send_text(f"\r\n\x1b[31m[Container Error: {str(e)}]\x1b[0m\r\n")
-        await websocket.close()
-        active_vm_sockets.pop(vm_id, None)
-        return
+        exec_cmd = [
+            "sh", "-c",
+            f"if command -v sshpass >/dev/null 2>&1; then "
+            f"  sshpass -p '{root_pass}' ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=QUIET -p 2222 root@127.0.0.1 2>/dev/null || /bin/bash || /bin/sh; "
+            f"else "
+            f"  /bin/bash || /bin/sh; "
+            f"fi"
+        ]
 
-    targets = [
-        (container_ip, 2222),
-        ("127.0.0.1", int(ssh_port)),
-        ("0.0.0.0", int(ssh_port))
-    ]
+        loop = asyncio.get_running_loop()
 
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    loop = asyncio.get_running_loop()
+        exec_instance = await loop.run_in_executor(
+            None,
+            lambda: docker_client.api.exec_create(
+                container.id,
+                cmd=exec_cmd,
+                stdin=True,
+                stdout=True,
+                stderr=True,
+                tty=True,
+                environment={"TERM": "xterm-256color"}
+            )
+        )
 
-    def try_connect():
-        for host, port in targets:
-            try:
-                ssh.connect(
-                    hostname=host,
-                    port=port,
-                    username="root",
-                    password=root_pass,
-                    look_for_keys=False,
-                    allow_agent=False,
-                    timeout=2
-                )
-                return True
-            except Exception:
-                continue
-        return False
+        stream = await loop.run_in_executor(
+            None,
+            lambda: docker_client.api.exec_start(exec_instance['Id'], socket=True, tty=True)
+        )
+        sock = stream._sock
+        sock.setblocking(False)
 
-    connected = False
-    for _ in range(25):
-        connected = await loop.run_in_executor(None, try_connect)
-        if connected:
-            break
-        await asyncio.sleep(1)
-
-    if not connected:
-        await websocket.send_text("\r\n\x1b[31m[System Error: Guest VM SSH Daemon Timed Out]\x1b[0m\r\n")
-        await websocket.close()
-        active_vm_sockets.pop(vm_id, None)
-        return
-
-    channel = ssh.invoke_shell(term='xterm-256color', width=100, height=30)
-    channel.setblocking(False)
-
-    async def pty_to_ws():
-        while not channel.closed:
-            try:
-                recv_data = await loop.run_in_executor(None, channel.recv, 1024)
-                if not recv_data:
+        async def pty_to_ws():
+            while True:
+                try:
+                    recv_data = await loop.run_in_executor(None, sock.recv, 1024)
+                    if not recv_data:
+                        break
+                    await websocket.send_text(recv_data.decode("utf-8", errors="ignore"))
+                except (BlockingIOError, socket.error):
+                    await asyncio.sleep(0.02)
+                except Exception:
                     break
-                await websocket.send_text(recv_data.decode("utf-8", errors="ignore"))
-            except (BlockingIOError, socket.error):
-                await asyncio.sleep(0.02)
-            except Exception:
-                break
 
-    async def ws_to_pty():
+        async def ws_to_pty():
+            try:
+                while True:
+                    msg = await websocket.receive_text()
+                    sock.sendall(msg.encode("utf-8", errors="ignore"))
+            except WebSocketDisconnect:
+                pass
+            except Exception:
+                pass
+
+        task_read = asyncio.create_task(pty_to_ws())
+        task_write = asyncio.create_task(ws_to_pty())
+
+        await asyncio.wait([task_read, task_write], return_when=asyncio.FIRST_COMPLETED)
+        
+        task_read.cancel()
+        task_write.cancel()
         try:
-            while not channel.closed:
-                msg = await websocket.receive_text()
-                await loop.run_in_executor(None, channel.send, msg)
-        except WebSocketDisconnect:
-            pass
+            sock.close()
         except Exception:
             pass
 
-    task_read = asyncio.create_task(pty_to_ws())
-    task_write = asyncio.create_task(ws_to_pty())
-
-    await asyncio.wait([task_read, task_write], return_when=asyncio.FIRST_COMPLETED)
-    
-    task_read.cancel()
-    task_write.cancel()
-    channel.close()
-    ssh.close()
+    except Exception as e:
+        await websocket.send_text(f"\r\n\x1b[31m[Terminal Bridge Error: {str(e)}]\x1b[0m\r\n")
+        await websocket.close()
 
     if active_vm_sockets.get(vm_id) == websocket:
         active_vm_sockets.pop(vm_id, None)
