@@ -31,7 +31,10 @@ NODE_NAME = "TEMPEST CLOUD"
 DOMAIN_NAME = "kvm.kingrules.bond"
 PANEL_PORT = 2345
 PANEL_URL = f"http://{DOMAIN_NAME}"
-DB_PATH = "tempest_vms.db"
+
+# ABSOLUTE DATABASE PATH (Prevents 'unable to open database file')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "tempest_vms.db")
 
 # Customer/Client Role ID
 CLIENT_ROLE_ID = 1545501965562159116
@@ -82,12 +85,18 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 docker_client = docker.from_env()
 app = FastAPI(title="Tempest Cloud Panel")
 
-# Single active terminal session tracker per VM: {vm_id: WebSocket}
+# Tracks active WebSocket session per VM
 active_vm_sockets: dict[int, WebSocket] = {}
 
-# ----------------- DATABASE SETUP -----------------
+# ----------------- CONCURRENCY-SAFE DATABASE HELPER -----------------
+def get_db():
+    return aiosqlite.connect(DB_PATH, timeout=15.0)
+
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
+        # Enable WAL mode and extended timeout for concurrent Discord + FastAPI access
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA busy_timeout=10000;")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS vms (
                 vm_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,7 +133,7 @@ async def init_db():
 async def is_admin(user_id: int) -> bool:
     if user_id == MAIN_OWNER_ID:
         return True
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)) as cur:
             return await cur.fetchone() is not None
 
@@ -189,7 +198,7 @@ async def grant_client_role(user_id: int):
                     pass
 
 async def revoke_client_role_if_empty(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT COUNT(*) FROM vms WHERE owner_id = ?", (user_id,)) as cur:
             count = (await cur.fetchone())[0]
 
@@ -285,11 +294,11 @@ def get_container_stats(container_name: str):
 
 # ----------------- ACCESS PERMISSIONS -----------------
 async def verify_vm_access(user_id_str: Optional[str], vm_id: int) -> tuple[bool, Optional[tuple]]:
-    if not user_id_str or not user_id_str.isdigit():
+    if not user_id_str or not str(user_id_str).isdigit():
         return False, None
     uid = int(user_id_str)
     admin = await is_admin(uid)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT owner_id, ssh_port, root_pass, container_name FROM vms WHERE vm_id = ?", (vm_id,)) as cur:
             row = await cur.fetchone()
     if not row:
@@ -643,17 +652,21 @@ async def login_page(request: Request):
 
 @app.post("/login")
 async def handle_login(request: Request, username: str = Form(...), password: str = Form(...)):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM panel_users WHERE username = ? AND password = ?", (username, password)) as cur:
-            row = await cur.fetchone()
-    
-    if not row:
+    try:
+        async with get_db() as db:
+            async with db.execute("SELECT user_id FROM panel_users WHERE username = ? AND password = ?", (username, password)) as cur:
+                row = await cur.fetchone()
+        
+        if not row:
+            t = Template(HTML_LOGIN_TEMPLATE)
+            return HTMLResponse(t.render(error="Invalid Client Identifier or Passkey."))
+        
+        response = RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
+        response.set_cookie("auth_session", str(row[0]), max_age=86400, httponly=True)
+        return response
+    except Exception as e:
         t = Template(HTML_LOGIN_TEMPLATE)
-        return HTMLResponse(t.render(error="Invalid Client Identifier or Passkey."))
-    
-    response = RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
-    response.set_cookie("auth_session", str(row[0]), max_age=86400, httponly=True)
-    return response
+        return HTMLResponse(t.render(error=f"Database Busy/Error: {str(e)}"))
 
 @app.get("/logout")
 async def logout():
@@ -670,22 +683,25 @@ async def dashboard_page(request: Request):
     uid = int(user_id)
     admin = await is_admin(uid)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        if admin:
-            query = "SELECT vm_id, ram, cpu, disk, expires_at FROM vms"
-            params = ()
-        else:
-            query = "SELECT vm_id, ram, cpu, disk, expires_at FROM vms WHERE owner_id = ?"
-            params = (uid,)
+    try:
+        async with get_db() as db:
+            if admin:
+                query = "SELECT vm_id, ram, cpu, disk, expires_at FROM vms"
+                params = ()
+            else:
+                query = "SELECT vm_id, ram, cpu, disk, expires_at FROM vms WHERE owner_id = ?"
+                params = (uid,)
 
-        async with db.execute(query, params) as cur:
-            vms = [{"vm_id": r[0], "ram": r[1], "cpu": r[2], "disk": r[3], "expires_at": r[4]} for r in await cur.fetchall()]
+            async with db.execute(query, params) as cur:
+                vms = [{"vm_id": r[0], "ram": r[1], "cpu": r[2], "disk": r[3], "expires_at": r[4]} for r in await cur.fetchall()]
 
-    if not vms:
-        return HTMLResponse("<body style='background:#0b0e14;color:#fff;font-family:sans-serif;padding:50px;'><h2>No active virtual machines found under your account.</h2><br><a style='color:#7952ff' href='/logout'>Sign Out</a></body>")
+        if not vms:
+            return HTMLResponse("<body style='background:#0b0e14;color:#fff;font-family:sans-serif;padding:50px;'><h2>No active virtual machines found under your account.</h2><br><a style='color:#7952ff' href='/logout'>Sign Out</a></body>")
 
-    t = Template(HTML_DASHBOARD_TEMPLATE)
-    return HTMLResponse(t.render(node_name=NODE_NAME, vms=vms))
+        t = Template(HTML_DASHBOARD_TEMPLATE)
+        return HTMLResponse(t.render(node_name=NODE_NAME, vms=vms))
+    except Exception as e:
+        return HTMLResponse(f"<h3>Database Read Error: {str(e)}</h3><br><a href='/logout'>Retry Login</a>")
 
 @app.get("/api/vm/{vm_id}/stats")
 async def api_vm_stats(request: Request, vm_id: int):
@@ -699,7 +715,6 @@ async def api_vm_stats(request: Request, vm_id: int):
 async def websocket_terminal(websocket: WebSocket, vm_id: int):
     await websocket.accept()
 
-    # Query param token with fallback to auth_session cookie
     auth_token = websocket.query_params.get("token") or websocket.cookies.get("auth_session")
     allowed, data = await verify_vm_access(auth_token, vm_id)
     if not allowed:
@@ -709,7 +724,6 @@ async def websocket_terminal(websocket: WebSocket, vm_id: int):
 
     owner_id, ssh_port, root_pass, c_name = data
 
-    # Clean existing socket for this specific VM if a separate socket connects
     if vm_id in active_vm_sockets and active_vm_sockets[vm_id] != websocket:
         old_ws = active_vm_sockets[vm_id]
         try:
@@ -904,7 +918,7 @@ class VMControlView(discord.ui.View):
         )
         await interaction.response.send_message(embed=loading, ephemeral=True)
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with get_db() as db:
             async with db.execute("SELECT ram, cpu, disk, vnc_port, ssh_port, vnc_pass, root_pass FROM vms WHERE vm_id = ?", (self.vm_id,)) as cur:
                 row = await cur.fetchone()
 
@@ -923,7 +937,7 @@ class VMControlView(discord.ui.View):
             new_id = await loop.run_in_executor(
                 None, launch_vm_container, self.container_name, ram, cpu, disk, vnc_port, ssh_port, vnc_pass, root_pass
             )
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with get_db() as db:
                 await db.execute("UPDATE vms SET container_id = ? WHERE vm_id = ?", (new_id, self.vm_id))
                 await db.commit()
 
@@ -1000,7 +1014,7 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
         panel_user = f"user_{user.id}"
         panel_pass = gen_password(10)
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with get_db() as db:
             cur = await db.execute("""
                 INSERT INTO vms (owner_id, container_name, container_id, vnc_port, ssh_port, ram, cpu, disk, root_pass, vnc_pass, created_at, expires_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1014,7 +1028,7 @@ async def create_vm(ctx, ram: str, cpu: str, disk: str, user: discord.User, days
         loop = asyncio.get_running_loop()
         cid = await loop.run_in_executor(None, launch_vm_container, c_name, ram, cpu, disk, vnc_port, ssh_port, vnc_pass, root_pass)
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with get_db() as db:
             await db.execute("UPDATE vms SET container_name = ?, container_id = ? WHERE vm_id = ?", (c_name, cid, vm_id))
             await db.commit()
 
@@ -1120,7 +1134,7 @@ async def manage_cmd(ctx, user: Optional[discord.User] = None):
         await ctx.reply(embed=err)
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT vm_id, container_name, ram, cpu, disk, ssh_port, vnc_port, expires_at FROM vms WHERE owner_id = ?", (target.id,)) as cur:
             records = await cur.fetchall()
 
@@ -1183,7 +1197,7 @@ async def delete_vm(ctx, target: Union[int, discord.User]):
     )
     msg = await ctx.reply(embed=progress_embed)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         if isinstance(target, int):
             async with db.execute("SELECT owner_id, container_name FROM vms WHERE vm_id = ?", (target,)) as cur:
                 row = await cur.fetchone()
@@ -1238,7 +1252,7 @@ async def renew_vm(ctx, target: discord.User, specific_vm_id: Optional[int] = No
         return
 
     now = datetime.datetime.now(datetime.timezone.utc)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         query = "SELECT vm_id, expires_at FROM vms WHERE owner_id = ?" + (" AND vm_id = ?" if specific_vm_id else "")
         params = (target.id, specific_vm_id) if specific_vm_id else (target.id,)
         async with db.execute(query, params) as cur:
@@ -1294,7 +1308,7 @@ async def set_expiration(ctx, target: discord.User, *args):
     now = datetime.datetime.now(datetime.timezone.utc)
     new_expiry = (now + duration).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         if specific_vm_id:
             await db.execute("UPDATE vms SET expires_at = ? WHERE owner_id = ? AND vm_id = ?", (new_expiry, target.id, specific_vm_id))
         else:
@@ -1324,7 +1338,7 @@ async def set_admin(ctx, target: discord.User):
         )
         return await ctx.reply(embed=err)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (target.id,))
         await db.commit()
 
@@ -1346,7 +1360,7 @@ async def remove_admin(ctx, target: discord.User):
         )
         return await ctx.reply(embed=err)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("DELETE FROM admins WHERE user_id = ?", (target.id,))
         await db.commit()
 
@@ -1405,7 +1419,7 @@ async def vinfo_cmd(ctx):
 async def vminfo_cmd(ctx):
     if not await is_admin(ctx.author.id):
         return
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT vm_id, owner_id, container_name, ram, cpu, disk, expires_at FROM vms") as cur:
             records = await cur.fetchall()
 
@@ -1441,57 +1455,63 @@ async def vminfo_cmd(ctx):
 # ----------------- MONITORS -----------------
 @tasks.loop(seconds=25)
 async def anti_mining_monitor():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT vm_id, owner_id, container_name FROM vms") as cur:
-            active_vms = await cur.fetchall()
+    try:
+        async with get_db() as db:
+            async with db.execute("SELECT vm_id, owner_id, container_name FROM vms") as cur:
+                active_vms = await cur.fetchall()
 
-    for vm_id, owner_id, c_name in active_vms:
-        try:
-            container = docker_client.containers.get(c_name)
-            if container.status != "running":
-                continue
-            res = container.exec_run("ps aux")
-            if res.exit_code != 0:
-                continue
-            ps_output = res.output.decode("utf-8", errors="ignore").lower()
-            detected = next((sig for sig in MINER_SIGNATURES if sig in ps_output), None)
-            if detected:
-                container.remove(force=True)
-                docker_client.volumes.get(f"{c_name}-data").remove(force=True)
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("DELETE FROM vms WHERE vm_id = ?", (vm_id,))
-                    await db.commit()
-                await revoke_client_role_if_empty(owner_id)
+        for vm_id, owner_id, c_name in active_vms:
+            try:
+                container = docker_client.containers.get(c_name)
+                if container.status != "running":
+                    continue
+                res = container.exec_run("ps aux")
+                if res.exit_code != 0:
+                    continue
+                ps_output = res.output.decode("utf-8", errors="ignore").lower()
+                detected = next((sig for sig in MINER_SIGNATURES if sig in ps_output), None)
+                if detected:
+                    container.remove(force=True)
+                    docker_client.volumes.get(f"{c_name}-data").remove(force=True)
+                    async with get_db() as db:
+                        await db.execute("DELETE FROM vms WHERE vm_id = ?", (vm_id,))
+                        await db.commit()
+                    await revoke_client_role_if_empty(owner_id)
 
-                channel = bot.get_channel(ALERT_CHANNEL_ID)
-                if channel:
-                    alert = discord.Embed(
-                        title=f"{E_WARN} SECURITY ALERT: CRYPTO MINING PURGE",
-                        description=f"Process signature `{detected}` detected on `{c_name}` (VM #{vm_id}). Container and NVMe storage destroyed.",
-                        color=0xED4245
-                    )
-                    await channel.send(content=f"<@{MINING_ALERT_PING_ID}>", embed=alert)
-        except Exception:
-            continue
+                    channel = bot.get_channel(ALERT_CHANNEL_ID)
+                    if channel:
+                        alert = discord.Embed(
+                            title=f"{E_WARN} SECURITY ALERT: CRYPTO MINING PURGE",
+                            description=f"Process signature `{detected}` detected on `{c_name}` (VM #{vm_id}). Container and NVMe storage destroyed.",
+                            color=0xED4245
+                        )
+                        await channel.send(content=f"<@{MINING_ALERT_PING_ID}>", embed=alert)
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 @tasks.loop(minutes=30)
 async def expiry_check_loop():
-    now = datetime.datetime.now(datetime.timezone.utc)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT vm_id, owner_id, container_name, expires_at FROM vms") as cur:
-            records = await cur.fetchall()
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        async with get_db() as db:
+            async with db.execute("SELECT vm_id, owner_id, container_name, expires_at FROM vms") as cur:
+                records = await cur.fetchall()
 
-        for vm_id, owner_id, c_name, exp_str in records:
-            try:
-                exp_dt = datetime.datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=datetime.timezone.utc)
-                if now >= exp_dt:
-                    docker_client.containers.get(c_name).remove(force=True)
-                    docker_client.volumes.get(f"{c_name}-data").remove(force=True)
-                    await db.execute("DELETE FROM vms WHERE vm_id = ?", (vm_id,))
-                    await db.commit()
-                    await revoke_client_role_if_empty(owner_id)
-            except Exception:
-                continue
+            for vm_id, owner_id, c_name, exp_str in records:
+                try:
+                    exp_dt = datetime.datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=datetime.timezone.utc)
+                    if now >= exp_dt:
+                        docker_client.containers.get(c_name).remove(force=True)
+                        docker_client.volumes.get(f"{c_name}-data").remove(force=True)
+                        await db.execute("DELETE FROM vms WHERE vm_id = ?", (vm_id,))
+                        await db.commit()
+                        await revoke_client_role_if_empty(owner_id)
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
 # ----------------- APPLICATION LAUNCHER -----------------
 def start_web_panel():
